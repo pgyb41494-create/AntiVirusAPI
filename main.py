@@ -33,6 +33,9 @@ class DetectionUpdate(BaseModel):
 class GuildWatchState(BaseModel):
     channel_id: int
     last_event_id: int = 0
+    alert_role_id: Optional[int] = None
+    alert_on_start: bool = True
+    alert_on_blocked: bool = True
 
 
 class GuildWatchesSync(BaseModel):
@@ -83,6 +86,16 @@ async def finish_session(session_id: str, x_api_key: Optional[str] = Header(None
         raise HTTPException(status_code=401, detail="Unauthorized")
     await storage.finish_session(session_id)
     return {"id": session_id, "finished": True}
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session(session_id: str, x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_bot_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Bot API key required")
+    session = await storage.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
 
 
 @app.post("/api/events")
@@ -147,7 +160,13 @@ async def sync_bot_watches(body: GuildWatchesSync, x_api_key: Optional[str] = He
     if not storage.verify_bot_key(x_api_key):
         raise HTTPException(status_code=401, detail="Bot API key required")
     payload = {
-        gid: {"channel_id": w.channel_id, "last_event_id": w.last_event_id}
+        gid: {
+            "channel_id": w.channel_id,
+            "last_event_id": w.last_event_id,
+            "alert_role_id": w.alert_role_id,
+            "alert_on_start": w.alert_on_start,
+            "alert_on_blocked": w.alert_on_blocked,
+        }
         for gid, w in body.watches.items()
     }
     await storage.sync_guild_watches(payload)

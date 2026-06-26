@@ -166,9 +166,21 @@ async def init_db() -> None:
                 guild_id TEXT PRIMARY KEY,
                 channel_id BIGINT NOT NULL,
                 last_event_id INTEGER NOT NULL DEFAULT 0,
+                alert_role_id BIGINT,
+                alert_on_start BOOLEAN NOT NULL DEFAULT TRUE,
+                alert_on_blocked BOOLEAN NOT NULL DEFAULT TRUE,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        await conn.execute(
+            "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS alert_role_id BIGINT"
+        )
+        await conn.execute(
+            "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS alert_on_start BOOLEAN NOT NULL DEFAULT TRUE"
+        )
+        await conn.execute(
+            "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS alert_on_blocked BOOLEAN NOT NULL DEFAULT TRUE"
+        )
     print("[storage] PostgreSQL ready")
 
 
@@ -228,6 +240,24 @@ async def finish_session(sid: str) -> None:
     pool = await _get_pool()
     async with pool.acquire() as conn:
         await conn.execute("UPDATE sessions SET finished_at = NOW() WHERE id = $1", sid)
+
+
+async def get_session(sid: str) -> Optional[dict]:
+    if not using_postgres():
+        return next((s for s in _memory.sessions if s["id"] == sid), None)
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM sessions WHERE id = $1", sid)
+    if not row:
+        return None
+    started = row["started_at"]
+    finished = row["finished_at"]
+    return {
+        "id": row["id"],
+        "label": row["label"],
+        "started_at": started.isoformat() if hasattr(started, "isoformat") else started,
+        "finished_at": finished.isoformat() if finished and hasattr(finished, "isoformat") else finished,
+    }
 
 
 async def add_event(data: dict) -> dict:
@@ -382,12 +412,19 @@ async def get_guild_watches() -> dict[str, dict]:
     pool = await _get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT guild_id, channel_id, last_event_id FROM discord_guild_watches"
+            """
+            SELECT guild_id, channel_id, last_event_id,
+                   alert_role_id, alert_on_start, alert_on_blocked
+            FROM discord_guild_watches
+            """
         )
     return {
         str(r["guild_id"]): {
             "channel_id": int(r["channel_id"]),
             "last_event_id": int(r["last_event_id"]),
+            "alert_role_id": int(r["alert_role_id"]) if r["alert_role_id"] else None,
+            "alert_on_start": bool(r["alert_on_start"]) if r["alert_on_start"] is not None else True,
+            "alert_on_blocked": bool(r["alert_on_blocked"]) if r["alert_on_blocked"] is not None else True,
         }
         for r in rows
     }
@@ -400,6 +437,9 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
             gid: {
                 "channel_id": int(data["channel_id"]),
                 "last_event_id": int(data.get("last_event_id", 0)),
+                "alert_role_id": data.get("alert_role_id"),
+                "alert_on_start": bool(data.get("alert_on_start", True)),
+                "alert_on_blocked": bool(data.get("alert_on_blocked", True)),
             }
             for gid, data in watches.items()
         }
@@ -417,14 +457,23 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
             for gid, data in watches.items():
                 await conn.execute(
                     """
-                    INSERT INTO discord_guild_watches (guild_id, channel_id, last_event_id, updated_at)
-                    VALUES ($1, $2, $3, NOW())
+                    INSERT INTO discord_guild_watches (
+                        guild_id, channel_id, last_event_id,
+                        alert_role_id, alert_on_start, alert_on_blocked, updated_at
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, NOW())
                     ON CONFLICT (guild_id) DO UPDATE SET
                         channel_id = EXCLUDED.channel_id,
                         last_event_id = EXCLUDED.last_event_id,
+                        alert_role_id = EXCLUDED.alert_role_id,
+                        alert_on_start = EXCLUDED.alert_on_start,
+                        alert_on_blocked = EXCLUDED.alert_on_blocked,
                         updated_at = NOW()
                     """,
                     gid,
                     int(data["channel_id"]),
                     int(data.get("last_event_id", 0)),
+                    int(data["alert_role_id"]) if data.get("alert_role_id") else None,
+                    bool(data.get("alert_on_start", True)),
+                    bool(data.get("alert_on_blocked", True)),
                 )

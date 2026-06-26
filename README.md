@@ -14,6 +14,7 @@ FastAPI backend for the AV research simulator. Deploy on **Railway** with Postgr
 | PATCH | `/api/events/{id}` | — | Update detected/blocked flags |
 | GET | `/api/bot/watches` | Bot key | Discord linked channels |
 | PUT | `/api/bot/watches` | Bot key | Save Discord linked channels |
+| GET | `/api/sessions/{id}` | Bot key | Session status (for scan report cards) |
 
 ## Railway deploy
 
