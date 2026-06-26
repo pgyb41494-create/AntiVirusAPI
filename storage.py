@@ -18,7 +18,7 @@ SIMULATOR_API_KEY = os.getenv("SIMULATOR_API_KEY", "")
 BOT_API_KEY = os.getenv("BOT_API_KEY", "")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 
-_pool: asyncpg.Pool | None = None
+_pg_pool: asyncpg.Pool | None = None
 
 
 def _pg_url(url: str) -> str:
@@ -125,11 +125,11 @@ class MemoryStore:
 _memory = MemoryStore()
 
 
-async def _pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(_pg_url(DATABASE_URL), min_size=1, max_size=5)
-    return _pool
+async def _get_pool() -> asyncpg.Pool:
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = await asyncpg.create_pool(_pg_url(DATABASE_URL), min_size=1, max_size=5)
+    return _pg_pool
 
 
 async def init_db() -> None:
