@@ -36,6 +36,7 @@ class MemoryStore:
     next_id: int = 1
     events: list[dict] = field(default_factory=list)
     sessions: list[dict] = field(default_factory=list)
+    guild_watches: dict[str, dict] = field(default_factory=dict)
 
     def create_session(self, sid: str, label: Optional[str]) -> dict:
         self.sessions = [s for s in self.sessions if s["id"] != sid]
@@ -158,6 +159,14 @@ async def init_db() -> None:
                 label TEXT,
                 started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 finished_at TIMESTAMPTZ
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS discord_guild_watches (
+                guild_id TEXT PRIMARY KEY,
+                channel_id BIGINT NOT NULL,
+                last_event_id INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
     print("[storage] PostgreSQL ready")
@@ -364,3 +373,58 @@ async def clear_events(session_id: Optional[str] = None) -> None:
             await conn.execute("DELETE FROM events WHERE session_id = $1", session_id)
         else:
             await conn.execute("DELETE FROM events")
+
+
+async def get_guild_watches() -> dict[str, dict]:
+    """Discord bot linked channels — persisted across bot restarts."""
+    if not using_postgres():
+        return dict(_memory.guild_watches)
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT guild_id, channel_id, last_event_id FROM discord_guild_watches"
+        )
+    return {
+        str(r["guild_id"]): {
+            "channel_id": int(r["channel_id"]),
+            "last_event_id": int(r["last_event_id"]),
+        }
+        for r in rows
+    }
+
+
+async def sync_guild_watches(watches: dict[str, dict]) -> None:
+    """Replace stored guild watches with the bot's current state."""
+    if not using_postgres():
+        _memory.guild_watches = {
+            gid: {
+                "channel_id": int(data["channel_id"]),
+                "last_event_id": int(data.get("last_event_id", 0)),
+            }
+            for gid, data in watches.items()
+        }
+        return
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            existing = await conn.fetch("SELECT guild_id FROM discord_guild_watches")
+            existing_ids = {str(r["guild_id"]) for r in existing}
+            incoming_ids = set(watches.keys())
+            for removed in existing_ids - incoming_ids:
+                await conn.execute(
+                    "DELETE FROM discord_guild_watches WHERE guild_id = $1", removed
+                )
+            for gid, data in watches.items():
+                await conn.execute(
+                    """
+                    INSERT INTO discord_guild_watches (guild_id, channel_id, last_event_id, updated_at)
+                    VALUES ($1, $2, $3, NOW())
+                    ON CONFLICT (guild_id) DO UPDATE SET
+                        channel_id = EXCLUDED.channel_id,
+                        last_event_id = EXCLUDED.last_event_id,
+                        updated_at = NOW()
+                    """,
+                    gid,
+                    int(data["channel_id"]),
+                    int(data.get("last_event_id", 0)),
+                )

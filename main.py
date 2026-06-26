@@ -30,6 +30,15 @@ class DetectionUpdate(BaseModel):
     blocked: Optional[bool] = None
 
 
+class GuildWatchState(BaseModel):
+    channel_id: int
+    last_event_id: int = 0
+
+
+class GuildWatchesSync(BaseModel):
+    watches: dict[str, GuildWatchState]
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     await storage.init_db()
@@ -123,3 +132,23 @@ async def clear_events(session_id: Optional[str] = None, x_api_key: Optional[str
         raise HTTPException(status_code=401, detail="Unauthorized")
     await storage.clear_events(session_id)
     return {"cleared": True}
+
+
+@app.get("/api/bot/watches")
+async def get_bot_watches(x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_bot_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Bot API key required")
+    watches = await storage.get_guild_watches()
+    return {"watches": watches}
+
+
+@app.put("/api/bot/watches")
+async def sync_bot_watches(body: GuildWatchesSync, x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_bot_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Bot API key required")
+    payload = {
+        gid: {"channel_id": w.channel_id, "last_event_id": w.last_event_id}
+        for gid, w in body.watches.items()
+    }
+    await storage.sync_guild_watches(payload)
+    return {"saved": len(payload)}
