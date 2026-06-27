@@ -34,9 +34,12 @@ def using_postgres() -> bool:
 @dataclass
 class MemoryStore:
     next_id: int = 1
+    next_cmd_id: int = 1
     events: list[dict] = field(default_factory=list)
     sessions: list[dict] = field(default_factory=list)
     guild_watches: dict[str, dict] = field(default_factory=dict)
+    heartbeats: dict[str, dict] = field(default_factory=dict)
+    commands: list[dict] = field(default_factory=list)
 
     def create_session(self, sid: str, label: Optional[str]) -> dict:
         self.sessions = [s for s in self.sessions if s["id"] != sid]
@@ -180,6 +183,35 @@ async def init_db() -> None:
         )
         await conn.execute(
             "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS alert_on_blocked BOOLEAN NOT NULL DEFAULT TRUE"
+        )
+        await conn.execute(
+            "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS control_channel_id BIGINT"
+        )
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS heartbeats (
+                hostname TEXT PRIMARY KEY,
+                username TEXT,
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS remote_commands (
+                id SERIAL PRIMARY KEY,
+                hostname TEXT NOT NULL,
+                module TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                guild_id TEXT,
+                command_kind TEXT NOT NULL DEFAULT 'module',
+                payload JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        await conn.execute(
+            "ALTER TABLE remote_commands ADD COLUMN IF NOT EXISTS command_kind TEXT NOT NULL DEFAULT 'module'"
+        )
+        await conn.execute(
+            "ALTER TABLE remote_commands ADD COLUMN IF NOT EXISTS payload JSONB"
         )
     print("[storage] PostgreSQL ready")
 
@@ -414,7 +446,8 @@ async def get_guild_watches() -> dict[str, dict]:
         rows = await conn.fetch(
             """
             SELECT guild_id, channel_id, last_event_id,
-                   alert_role_id, alert_on_start, alert_on_blocked
+                   alert_role_id, alert_on_start, alert_on_blocked,
+                   control_channel_id
             FROM discord_guild_watches
             """
         )
@@ -425,6 +458,7 @@ async def get_guild_watches() -> dict[str, dict]:
             "alert_role_id": int(r["alert_role_id"]) if r["alert_role_id"] else None,
             "alert_on_start": bool(r["alert_on_start"]) if r["alert_on_start"] is not None else True,
             "alert_on_blocked": bool(r["alert_on_blocked"]) if r["alert_on_blocked"] is not None else True,
+            "control_channel_id": int(r["control_channel_id"]) if r.get("control_channel_id") else None,
         }
         for r in rows
     }
@@ -440,6 +474,9 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
                 "alert_role_id": data.get("alert_role_id"),
                 "alert_on_start": bool(data.get("alert_on_start", True)),
                 "alert_on_blocked": bool(data.get("alert_on_blocked", True)),
+                "control_channel_id": int(data["control_channel_id"])
+                if data.get("control_channel_id")
+                else None,
             }
             for gid, data in watches.items()
         }
@@ -459,15 +496,17 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
                     """
                     INSERT INTO discord_guild_watches (
                         guild_id, channel_id, last_event_id,
-                        alert_role_id, alert_on_start, alert_on_blocked, updated_at
+                        alert_role_id, alert_on_start, alert_on_blocked,
+                        control_channel_id, updated_at
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
                     ON CONFLICT (guild_id) DO UPDATE SET
                         channel_id = EXCLUDED.channel_id,
                         last_event_id = EXCLUDED.last_event_id,
                         alert_role_id = EXCLUDED.alert_role_id,
                         alert_on_start = EXCLUDED.alert_on_start,
                         alert_on_blocked = EXCLUDED.alert_on_blocked,
+                        control_channel_id = EXCLUDED.control_channel_id,
                         updated_at = NOW()
                     """,
                     gid,
@@ -476,4 +515,185 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
                     int(data["alert_role_id"]) if data.get("alert_role_id") else None,
                     bool(data.get("alert_on_start", True)),
                     bool(data.get("alert_on_blocked", True)),
+                    int(data["control_channel_id"]) if data.get("control_channel_id") else None,
                 )
+
+
+async def upsert_heartbeat(hostname: str, username: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    if not using_postgres():
+        _memory.heartbeats[hostname] = {
+            "hostname": hostname,
+            "username": username,
+            "last_seen": now,
+        }
+        return
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO heartbeats (hostname, username, last_seen)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (hostname) DO UPDATE SET
+                username = EXCLUDED.username,
+                last_seen = NOW()
+            """,
+            hostname,
+            username,
+        )
+
+
+async def list_online_hosts(minutes: int = 3) -> list[dict]:
+    if not using_postgres():
+        cutoff = datetime.now(timezone.utc).timestamp() - minutes * 60
+        hosts = []
+        for row in _memory.heartbeats.values():
+            try:
+                seen = datetime.fromisoformat(row["last_seen"].replace("Z", "+00:00"))
+                if seen.timestamp() >= cutoff:
+                    hosts.append(row)
+            except (ValueError, KeyError):
+                continue
+        hosts.sort(key=lambda h: h.get("last_seen", ""), reverse=True)
+        return hosts
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT hostname, username, last_seen
+            FROM heartbeats
+            WHERE last_seen >= NOW() - ($1 || ' minutes')::interval
+            ORDER BY last_seen DESC
+            """,
+            str(minutes),
+        )
+    return [
+        {
+            "hostname": r["hostname"],
+            "username": r["username"] or "",
+            "last_seen": r["last_seen"].isoformat(),
+        }
+        for r in rows
+    ]
+
+
+async def create_remote_command(
+    hostname: str,
+    guild_id: Optional[str] = None,
+    *,
+    module: Optional[str] = None,
+    command_kind: str = "module",
+    payload: Optional[dict] = None,
+) -> dict:
+    import uuid
+
+    session_id = ""
+    mod = module or ""
+    if command_kind == "module":
+        if not mod:
+            raise ValueError("module is required for module commands")
+        session_id = str(uuid.uuid4())
+        await create_session(session_id, label=f"remote:{hostname}")
+    if not using_postgres():
+        cmd = {
+            "id": _memory.next_cmd_id,
+            "hostname": hostname,
+            "module": mod,
+            "session_id": session_id,
+            "status": "pending",
+            "guild_id": guild_id,
+            "command_kind": command_kind,
+            "payload": payload or {},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _memory.next_cmd_id += 1
+        _memory.commands.append(cmd)
+        return cmd
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO remote_commands (
+                hostname, module, session_id, status, guild_id, command_kind, payload
+            )
+            VALUES ($1, $2, $3, 'pending', $4, $5, $6::jsonb)
+            RETURNING id, hostname, module, session_id, status, guild_id,
+                      command_kind, payload, created_at
+            """,
+            hostname,
+            mod,
+            session_id,
+            guild_id,
+            command_kind,
+            json.dumps(payload or {}),
+        )
+    pl = row["payload"]
+    if isinstance(pl, str):
+        pl = json.loads(pl) if pl else {}
+    return {
+        "id": int(row["id"]),
+        "hostname": row["hostname"],
+        "module": row["module"],
+        "session_id": row["session_id"],
+        "status": row["status"],
+        "guild_id": row["guild_id"],
+        "command_kind": row["command_kind"],
+        "payload": pl or {},
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
+async def list_pending_commands(hostname: str) -> list[dict]:
+    if not using_postgres():
+        pending = [
+            c
+            for c in _memory.commands
+            if c["hostname"] == hostname and c["status"] == "pending"
+        ]
+        pending.sort(key=lambda c: c["id"])
+        return pending
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, hostname, module, session_id, status, command_kind, payload, created_at
+            FROM remote_commands
+            WHERE hostname = $1 AND status = 'pending'
+            ORDER BY id ASC
+            """,
+            hostname,
+        )
+    out = []
+    for r in rows:
+        pl = r["payload"]
+        if isinstance(pl, str):
+            pl = json.loads(pl) if pl else {}
+        out.append(
+            {
+                "id": int(r["id"]),
+                "hostname": r["hostname"],
+                "module": r["module"],
+                "session_id": r["session_id"],
+                "status": r["status"],
+                "command_kind": r.get("command_kind") or "module",
+                "payload": pl or {},
+                "created_at": r["created_at"].isoformat(),
+            }
+        )
+    return out
+
+
+async def complete_remote_command(command_id: int) -> bool:
+    if not using_postgres():
+        for cmd in _memory.commands:
+            if cmd["id"] == command_id:
+                cmd["status"] = "done"
+                return True
+        return False
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            "UPDATE remote_commands SET status = 'done' WHERE id = $1 AND status = 'pending'",
+            command_id,
+        )
+    return result.endswith("1")

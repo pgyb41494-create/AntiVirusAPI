@@ -36,6 +36,20 @@ class GuildWatchState(BaseModel):
     alert_role_id: Optional[int] = None
     alert_on_start: bool = True
     alert_on_blocked: bool = True
+    control_channel_id: Optional[int] = None
+
+
+class HeartbeatCreate(BaseModel):
+    hostname: str
+    username: str = ""
+
+
+class RemoteCommandCreate(BaseModel):
+    hostname: str
+    guild_id: Optional[str] = None
+    module: Optional[str] = None
+    command_kind: str = "module"
+    payload: Optional[dict] = None
 
 
 class GuildWatchesSync(BaseModel):
@@ -166,8 +180,70 @@ async def sync_bot_watches(body: GuildWatchesSync, x_api_key: Optional[str] = He
             "alert_role_id": w.alert_role_id,
             "alert_on_start": w.alert_on_start,
             "alert_on_blocked": w.alert_on_blocked,
+            "control_channel_id": w.control_channel_id,
         }
         for gid, w in body.watches.items()
     }
     await storage.sync_guild_watches(payload)
     return {"saved": len(payload)}
+
+
+@app.post("/api/heartbeat")
+async def post_heartbeat(body: HeartbeatCreate, x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_simulator_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    await storage.upsert_heartbeat(body.hostname, body.username)
+    return {"ok": True}
+
+
+@app.get("/api/commands/pending")
+async def get_pending_commands(
+    hostname: str,
+    x_api_key: Optional[str] = Header(None),
+):
+    if not storage.verify_simulator_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return await storage.list_pending_commands(hostname)
+
+
+@app.post("/api/commands/{command_id}/complete")
+async def complete_command(command_id: int, x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_simulator_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    ok = await storage.complete_remote_command(command_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Command not found")
+    return {"completed": True}
+
+
+@app.post("/api/bot/commands")
+async def queue_remote_command(body: RemoteCommandCreate, x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_bot_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Bot API key required")
+    kind = body.command_kind or "module"
+    if kind == "module" and not body.module:
+        raise HTTPException(status_code=400, detail="module is required for module commands")
+    if kind == "input" and not body.payload:
+        raise HTTPException(status_code=400, detail="payload is required for input commands")
+    try:
+        cmd = await storage.create_remote_command(
+            body.hostname,
+            body.guild_id,
+            module=body.module,
+            command_kind=kind,
+            payload=body.payload,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return cmd
+
+
+@app.get("/api/bot/online")
+async def list_online(
+    minutes: int = Query(3, ge=1, le=30),
+    x_api_key: Optional[str] = Header(None),
+):
+    if not storage.verify_bot_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Bot API key required")
+    hosts = await storage.list_online_hosts(minutes)
+    return {"hosts": hosts, "minutes": minutes}
