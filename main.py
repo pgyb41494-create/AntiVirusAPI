@@ -46,6 +46,11 @@ class HeartbeatCreate(BaseModel):
     screen_height: Optional[int] = None
 
 
+class LiveviewFramePut(BaseModel):
+    hostname: str
+    payload: dict
+
+
 class LiveviewSet(BaseModel):
     hostname: str
     enabled: bool
@@ -221,6 +226,16 @@ async def get_liveview_state(
     return await storage.get_liveview(hostname)
 
 
+@app.put("/api/liveview/frame")
+async def push_liveview_frame(body: LiveviewFramePut, x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_simulator_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    if not body.payload.get("image_base64"):
+        raise HTTPException(status_code=400, detail="image_base64 required")
+    event = await storage.upsert_liveview_frame(body.hostname, body.payload)
+    return {"ok": True, "frame_id": event["id"]}
+
+
 @app.put("/api/bot/liveview")
 async def set_liveview_state(body: LiveviewSet, x_api_key: Optional[str] = Header(None)):
     if not storage.verify_bot_key(x_api_key):
@@ -291,9 +306,5 @@ async def latest_liveview(
 ):
     if not storage.verify_bot_key(x_api_key):
         raise HTTPException(status_code=401, detail="Bot API key required")
-    event = await storage.latest_liveview_event(hostname)
-    if not event:
-        return {"event": None}
-    if since_id is not None and int(event["id"]) <= since_id:
-        return {"event": None}
+    event = await storage.latest_liveview_event(hostname, since_id)
     return {"event": event}

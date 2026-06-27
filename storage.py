@@ -19,6 +19,7 @@ BOT_API_KEY = os.getenv("BOT_API_KEY", "")
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()]
 
 _pg_pool: asyncpg.Pool | None = None
+_liveview_cache: dict[str, dict] = {}
 
 
 def _pg_url(url: str) -> str:
@@ -41,6 +42,7 @@ class MemoryStore:
     heartbeats: dict[str, dict] = field(default_factory=dict)
     commands: list[dict] = field(default_factory=list)
     liveview: dict[str, dict] = field(default_factory=dict)
+    liveview_frames: dict[str, dict] = field(default_factory=dict)
 
     def create_session(self, sid: str, label: Optional[str]) -> dict:
         self.sessions = [s for s in self.sessions if s["id"] != sid]
@@ -721,27 +723,47 @@ async def complete_remote_command(command_id: int) -> bool:
     return result.endswith("1")
 
 
-async def latest_liveview_event(hostname: str) -> dict | None:
-    """Most recent liveview frame for a host (website fast poll)."""
+async def latest_liveview_event(hostname: str, since_id: Optional[int] = None) -> dict | None:
+    """Latest frame — in-memory cache first (30fps path), then DB."""
+    cached = _liveview_cache.get(hostname)
+    if cached:
+        if since_id is not None and int(cached["id"]) <= since_id:
+            return None
+        return cached
+
     if not using_postgres():
-        for event in _memory.events:
+        for event in reversed(_memory.events):
             if event.get("module") != "liveview":
                 continue
             payload = event.get("payload") or {}
             if payload.get("hostname") == hostname and payload.get("image_base64"):
+                if since_id is not None and int(event["id"]) <= since_id:
+                    return None
                 return event
+        row = _memory.liveview_frames.get(hostname)
+        if row:
+            if since_id is not None and int(row["id"]) <= since_id:
+                return None
+            return row
         return None
+
     pool = await _get_pool()
     async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS liveview_frames (
+                hostname TEXT PRIMARY KEY,
+                frame_id BIGINT NOT NULL DEFAULT 0,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
         row = await conn.fetchrow(
             """
-            SELECT id, module, action, status, payload, session_id, created_at
-            FROM events
-            WHERE module = 'liveview'
-              AND payload->>'hostname' = $1
-              AND payload ? 'image_base64'
-            ORDER BY id DESC
-            LIMIT 1
+            SELECT frame_id, payload, updated_at
+            FROM liveview_frames
+            WHERE hostname = $1
             """,
             hostname,
         )
@@ -750,15 +772,81 @@ async def latest_liveview_event(hostname: str) -> dict | None:
     payload = row["payload"]
     if isinstance(payload, str):
         payload = json.loads(payload) if payload else {}
-    return {
-        "id": int(row["id"]),
-        "module": row["module"],
-        "action": row["action"],
-        "status": row["status"],
+    fid = int(row["frame_id"])
+    if since_id is not None and fid <= since_id:
+        return None
+    event = {
+        "id": fid,
+        "module": "liveview",
+        "action": "screen_frame",
+        "status": "success",
         "payload": payload,
-        "session_id": row["session_id"],
-        "created_at": row["created_at"].isoformat(),
+        "session_id": None,
+        "created_at": row["updated_at"].isoformat(),
     }
+    _liveview_cache[hostname] = event
+    return event
+
+
+async def upsert_liveview_frame(hostname: str, payload: dict) -> dict:
+    """Fast single-row frame store for high-FPS streaming (not the events table)."""
+    host = hostname.strip()
+    merged = {**payload, "hostname": host}
+    now = datetime.now(timezone.utc).isoformat()
+
+    if not using_postgres():
+        prev = _memory.liveview_frames.get(host, {})
+        fid = int(prev.get("id") or 0) + 1
+        event = {
+            "id": fid,
+            "module": "liveview",
+            "action": "screen_frame",
+            "status": "success",
+            "payload": merged,
+            "session_id": None,
+            "created_at": now,
+        }
+        _memory.liveview_frames[host] = event
+        _liveview_cache[host] = event
+        return event
+
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS liveview_frames (
+                hostname TEXT PRIMARY KEY,
+                frame_id BIGINT NOT NULL DEFAULT 0,
+                payload JSONB NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        row = await conn.fetchrow(
+            """
+            INSERT INTO liveview_frames (hostname, frame_id, payload, updated_at)
+            VALUES ($1, 1, $2::jsonb, NOW())
+            ON CONFLICT (hostname) DO UPDATE SET
+                frame_id = liveview_frames.frame_id + 1,
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            RETURNING frame_id, updated_at
+            """,
+            host,
+            json.dumps(merged),
+        )
+    fid = int(row["frame_id"])
+    event = {
+        "id": fid,
+        "module": "liveview",
+        "action": "screen_frame",
+        "status": "success",
+        "payload": merged,
+        "session_id": None,
+        "created_at": row["updated_at"].isoformat(),
+    }
+    _liveview_cache[host] = event
+    return event
 
 
 async def set_liveview(
@@ -769,12 +857,12 @@ async def set_liveview(
     quality: str = "balanced",
 ) -> dict:
     q = (quality or "balanced").strip().lower()
-    if q not in ("speed", "balanced", "hd", "full"):
+    if q not in ("ultra", "speed", "balanced", "hd", "full"):
         q = "balanced"
     state = {
         "hostname": hostname,
         "enabled": enabled,
-        "interval": max(0.08, float(interval)),
+        "interval": max(0.033, float(interval)),
         "quality": q,
         "guild_id": guild_id,
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -784,6 +872,8 @@ async def set_liveview(
             _memory.liveview[hostname] = state
         else:
             _memory.liveview.pop(hostname, None)
+            _memory.liveview_frames.pop(hostname, None)
+            _liveview_cache.pop(hostname, None)
         return state
     pool = await _get_pool()
     async with pool.acquire() as conn:
@@ -824,6 +914,8 @@ async def set_liveview(
                 "UPDATE liveview_sessions SET enabled = FALSE, updated_at = NOW() WHERE hostname = $1",
                 hostname,
             )
+            await conn.execute("DELETE FROM liveview_frames WHERE hostname = $1", hostname)
+            _liveview_cache.pop(hostname, None)
     return state
 
 
