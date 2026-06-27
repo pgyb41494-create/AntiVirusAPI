@@ -770,7 +770,7 @@ async def set_liveview(
     state = {
         "hostname": hostname,
         "enabled": enabled,
-        "interval": max(0.25, float(interval)),
+        "interval": max(0.12, float(interval)),
         "guild_id": guild_id,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
