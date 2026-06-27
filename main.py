@@ -38,6 +38,8 @@ class GuildWatchState(BaseModel):
     alert_role_id: Optional[int] = None
     alert_on_start: bool = True
     alert_on_blocked: bool = True
+    alert_on_online: bool = True
+    alert_on_offline: bool = True
     control_channel_id: Optional[int] = None
 
 
@@ -197,6 +199,8 @@ async def sync_bot_watches(body: GuildWatchesSync, x_api_key: Optional[str] = He
             "alert_role_id": w.alert_role_id,
             "alert_on_start": w.alert_on_start,
             "alert_on_blocked": w.alert_on_blocked,
+            "alert_on_online": w.alert_on_online,
+            "alert_on_offline": w.alert_on_offline,
             "control_channel_id": w.control_channel_id,
         }
         for gid, w in body.watches.items()

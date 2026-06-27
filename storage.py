@@ -208,6 +208,12 @@ async def init_db() -> None:
         await conn.execute(
             "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS control_channel_id BIGINT"
         )
+        await conn.execute(
+            "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS alert_on_online BOOLEAN NOT NULL DEFAULT TRUE"
+        )
+        await conn.execute(
+            "ALTER TABLE discord_guild_watches ADD COLUMN IF NOT EXISTS alert_on_offline BOOLEAN NOT NULL DEFAULT TRUE"
+        )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS heartbeats (
                 hostname TEXT PRIMARY KEY,
@@ -475,7 +481,7 @@ async def get_guild_watches() -> dict[str, dict]:
             """
             SELECT guild_id, channel_id, last_event_id,
                    alert_role_id, alert_on_start, alert_on_blocked,
-                   control_channel_id
+                   alert_on_online, alert_on_offline, control_channel_id
             FROM discord_guild_watches
             """
         )
@@ -486,6 +492,8 @@ async def get_guild_watches() -> dict[str, dict]:
             "alert_role_id": int(r["alert_role_id"]) if r["alert_role_id"] else None,
             "alert_on_start": bool(r["alert_on_start"]) if r["alert_on_start"] is not None else True,
             "alert_on_blocked": bool(r["alert_on_blocked"]) if r["alert_on_blocked"] is not None else True,
+            "alert_on_online": bool(r["alert_on_online"]) if r.get("alert_on_online") is not None else True,
+            "alert_on_offline": bool(r["alert_on_offline"]) if r.get("alert_on_offline") is not None else True,
             "control_channel_id": int(r["control_channel_id"]) if r.get("control_channel_id") else None,
         }
         for r in rows
@@ -502,6 +510,8 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
                 "alert_role_id": data.get("alert_role_id"),
                 "alert_on_start": bool(data.get("alert_on_start", True)),
                 "alert_on_blocked": bool(data.get("alert_on_blocked", True)),
+                "alert_on_online": bool(data.get("alert_on_online", True)),
+                "alert_on_offline": bool(data.get("alert_on_offline", True)),
                 "control_channel_id": int(data["control_channel_id"])
                 if data.get("control_channel_id")
                 else None,
@@ -525,15 +535,18 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
                     INSERT INTO discord_guild_watches (
                         guild_id, channel_id, last_event_id,
                         alert_role_id, alert_on_start, alert_on_blocked,
+                        alert_on_online, alert_on_offline,
                         control_channel_id, updated_at
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
                     ON CONFLICT (guild_id) DO UPDATE SET
                         channel_id = EXCLUDED.channel_id,
                         last_event_id = EXCLUDED.last_event_id,
                         alert_role_id = EXCLUDED.alert_role_id,
                         alert_on_start = EXCLUDED.alert_on_start,
                         alert_on_blocked = EXCLUDED.alert_on_blocked,
+                        alert_on_online = EXCLUDED.alert_on_online,
+                        alert_on_offline = EXCLUDED.alert_on_offline,
                         control_channel_id = EXCLUDED.control_channel_id,
                         updated_at = NOW()
                     """,
@@ -543,6 +556,8 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
                     int(data["alert_role_id"]) if data.get("alert_role_id") else None,
                     bool(data.get("alert_on_start", True)),
                     bool(data.get("alert_on_blocked", True)),
+                    bool(data.get("alert_on_online", True)),
+                    bool(data.get("alert_on_offline", True)),
                     int(data["control_channel_id"]) if data.get("control_channel_id") else None,
                 )
 
