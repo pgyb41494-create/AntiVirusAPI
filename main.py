@@ -278,3 +278,19 @@ async def list_online(
         raise HTTPException(status_code=401, detail="Bot API key required")
     hosts = await storage.list_online_hosts(minutes)
     return {"hosts": hosts, "minutes": minutes}
+
+
+@app.get("/api/bot/liveview/latest")
+async def latest_liveview(
+    hostname: str,
+    since_id: Optional[int] = Query(None),
+    x_api_key: Optional[str] = Header(None),
+):
+    if not storage.verify_bot_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Bot API key required")
+    event = await storage.latest_liveview_event(hostname)
+    if not event:
+        return {"event": None}
+    if since_id is not None and int(event["id"]) <= since_id:
+        return {"event": None}
+    return {"event": event}

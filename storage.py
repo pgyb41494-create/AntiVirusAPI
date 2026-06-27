@@ -721,6 +721,46 @@ async def complete_remote_command(command_id: int) -> bool:
     return result.endswith("1")
 
 
+async def latest_liveview_event(hostname: str) -> dict | None:
+    """Most recent liveview frame for a host (website fast poll)."""
+    if not using_postgres():
+        for event in _memory.events:
+            if event.get("module") != "liveview":
+                continue
+            payload = event.get("payload") or {}
+            if payload.get("hostname") == hostname and payload.get("image_base64"):
+                return event
+        return None
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, module, action, status, payload, session_id, created_at
+            FROM events
+            WHERE module = 'liveview'
+              AND payload->>'hostname' = $1
+              AND payload ? 'image_base64'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            hostname,
+        )
+    if not row:
+        return None
+    payload = row["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload) if payload else {}
+    return {
+        "id": int(row["id"]),
+        "module": row["module"],
+        "action": row["action"],
+        "status": row["status"],
+        "payload": payload,
+        "session_id": row["session_id"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
+
 async def set_liveview(
     hostname: str,
     enabled: bool,
@@ -730,7 +770,7 @@ async def set_liveview(
     state = {
         "hostname": hostname,
         "enabled": enabled,
-        "interval": max(2.0, float(interval)),
+        "interval": max(0.25, float(interval)),
         "guild_id": guild_id,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
