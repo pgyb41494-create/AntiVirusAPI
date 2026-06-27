@@ -766,11 +766,16 @@ async def set_liveview(
     enabled: bool,
     interval: float = 3.0,
     guild_id: str | None = None,
+    quality: str = "balanced",
 ) -> dict:
+    q = (quality or "balanced").strip().lower()
+    if q not in ("speed", "balanced", "hd", "full"):
+        q = "balanced"
     state = {
         "hostname": hostname,
         "enabled": enabled,
-        "interval": max(0.12, float(interval)),
+        "interval": max(0.08, float(interval)),
+        "quality": q,
         "guild_id": guild_id,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -788,24 +793,30 @@ async def set_liveview(
                 hostname TEXT PRIMARY KEY,
                 enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 interval_seconds REAL NOT NULL DEFAULT 3,
+                quality_preset TEXT NOT NULL DEFAULT 'balanced',
                 guild_id TEXT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
+        await conn.execute(
+            "ALTER TABLE liveview_sessions ADD COLUMN IF NOT EXISTS quality_preset TEXT NOT NULL DEFAULT 'balanced'"
+        )
         if enabled:
             await conn.execute(
                 """
-                INSERT INTO liveview_sessions (hostname, enabled, interval_seconds, guild_id, updated_at)
-                VALUES ($1, TRUE, $2, $3, NOW())
+                INSERT INTO liveview_sessions (hostname, enabled, interval_seconds, quality_preset, guild_id, updated_at)
+                VALUES ($1, TRUE, $2, $3, $4, NOW())
                 ON CONFLICT (hostname) DO UPDATE SET
                     enabled = TRUE,
                     interval_seconds = EXCLUDED.interval_seconds,
+                    quality_preset = EXCLUDED.quality_preset,
                     guild_id = EXCLUDED.guild_id,
                     updated_at = NOW()
                 """,
                 hostname,
                 state["interval"],
+                q,
                 guild_id,
             )
         else:
@@ -823,6 +834,7 @@ async def get_liveview(hostname: str) -> dict:
             "hostname": hostname,
             "enabled": bool(row.get("enabled")),
             "interval": float(row.get("interval") or 3),
+            "quality": str(row.get("quality") or "balanced"),
         }
     pool = await _get_pool()
     async with pool.acquire() as conn:
@@ -832,19 +844,24 @@ async def get_liveview(hostname: str) -> dict:
                 hostname TEXT PRIMARY KEY,
                 enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 interval_seconds REAL NOT NULL DEFAULT 3,
+                quality_preset TEXT NOT NULL DEFAULT 'balanced',
                 guild_id TEXT,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
+        await conn.execute(
+            "ALTER TABLE liveview_sessions ADD COLUMN IF NOT EXISTS quality_preset TEXT NOT NULL DEFAULT 'balanced'"
+        )
         row = await conn.fetchrow(
-            "SELECT enabled, interval_seconds FROM liveview_sessions WHERE hostname = $1",
+            "SELECT enabled, interval_seconds, quality_preset FROM liveview_sessions WHERE hostname = $1",
             hostname,
         )
     if not row:
-        return {"hostname": hostname, "enabled": False, "interval": 3}
+        return {"hostname": hostname, "enabled": False, "interval": 3, "quality": "balanced"}
     return {
         "hostname": hostname,
         "enabled": bool(row["enabled"]),
         "interval": float(row["interval_seconds"] or 3),
+        "quality": str(row["quality_preset"] or "balanced"),
     }

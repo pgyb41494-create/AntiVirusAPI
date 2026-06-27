@@ -50,6 +50,7 @@ class LiveviewSet(BaseModel):
     hostname: str
     enabled: bool
     interval: float = 3.0
+    quality: str = "balanced"
     guild_id: Optional[str] = None
 
 
@@ -224,7 +225,9 @@ async def get_liveview_state(
 async def set_liveview_state(body: LiveviewSet, x_api_key: Optional[str] = Header(None)):
     if not storage.verify_bot_key(x_api_key):
         raise HTTPException(status_code=401, detail="Bot API key required")
-    return await storage.set_liveview(body.hostname, body.enabled, body.interval, body.guild_id)
+    return await storage.set_liveview(
+        body.hostname, body.enabled, body.interval, body.guild_id, body.quality
+    )
 
 
 @app.get("/api/commands/pending")
