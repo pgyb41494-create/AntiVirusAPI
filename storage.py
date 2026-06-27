@@ -40,6 +40,7 @@ class MemoryStore:
     guild_watches: dict[str, dict] = field(default_factory=dict)
     heartbeats: dict[str, dict] = field(default_factory=dict)
     commands: list[dict] = field(default_factory=list)
+    liveview: dict[str, dict] = field(default_factory=dict)
 
     def create_session(self, sid: str, label: Optional[str]) -> dict:
         self.sessions = [s for s in self.sessions if s["id"] != sid]
@@ -191,9 +192,17 @@ async def init_db() -> None:
             CREATE TABLE IF NOT EXISTS heartbeats (
                 hostname TEXT PRIMARY KEY,
                 username TEXT,
-                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                screen_width INTEGER,
+                screen_height INTEGER
             )
         """)
+        await conn.execute(
+            "ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS screen_width INTEGER"
+        )
+        await conn.execute(
+            "ALTER TABLE heartbeats ADD COLUMN IF NOT EXISTS screen_height INTEGER"
+        )
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS remote_commands (
                 id SERIAL PRIMARY KEY,
@@ -519,27 +528,38 @@ async def sync_guild_watches(watches: dict[str, dict]) -> None:
                 )
 
 
-async def upsert_heartbeat(hostname: str, username: str) -> None:
+async def upsert_heartbeat(
+    hostname: str,
+    username: str,
+    screen_width: int | None = None,
+    screen_height: int | None = None,
+) -> None:
     now = datetime.now(timezone.utc).isoformat()
     if not using_postgres():
         _memory.heartbeats[hostname] = {
             "hostname": hostname,
             "username": username,
             "last_seen": now,
+            "screen_width": screen_width,
+            "screen_height": screen_height,
         }
         return
     pool = await _get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             """
-            INSERT INTO heartbeats (hostname, username, last_seen)
-            VALUES ($1, $2, NOW())
+            INSERT INTO heartbeats (hostname, username, last_seen, screen_width, screen_height)
+            VALUES ($1, $2, NOW(), $3, $4)
             ON CONFLICT (hostname) DO UPDATE SET
                 username = EXCLUDED.username,
-                last_seen = NOW()
+                last_seen = NOW(),
+                screen_width = EXCLUDED.screen_width,
+                screen_height = EXCLUDED.screen_height
             """,
             hostname,
             username,
+            screen_width,
+            screen_height,
         )
 
 
@@ -560,7 +580,7 @@ async def list_online_hosts(minutes: int = 3) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT hostname, username, last_seen
+            SELECT hostname, username, last_seen, screen_width, screen_height
             FROM heartbeats
             WHERE last_seen >= NOW() - ($1 || ' minutes')::interval
             ORDER BY last_seen DESC
@@ -572,6 +592,8 @@ async def list_online_hosts(minutes: int = 3) -> list[dict]:
             "hostname": r["hostname"],
             "username": r["username"] or "",
             "last_seen": r["last_seen"].isoformat(),
+            "screen_width": r["screen_width"],
+            "screen_height": r["screen_height"],
         }
         for r in rows
     ]
@@ -697,3 +719,92 @@ async def complete_remote_command(command_id: int) -> bool:
             command_id,
         )
     return result.endswith("1")
+
+
+async def set_liveview(
+    hostname: str,
+    enabled: bool,
+    interval: float = 3.0,
+    guild_id: str | None = None,
+) -> dict:
+    state = {
+        "hostname": hostname,
+        "enabled": enabled,
+        "interval": max(2.0, float(interval)),
+        "guild_id": guild_id,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if not using_postgres():
+        if enabled:
+            _memory.liveview[hostname] = state
+        else:
+            _memory.liveview.pop(hostname, None)
+        return state
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS liveview_sessions (
+                hostname TEXT PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                interval_seconds REAL NOT NULL DEFAULT 3,
+                guild_id TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        if enabled:
+            await conn.execute(
+                """
+                INSERT INTO liveview_sessions (hostname, enabled, interval_seconds, guild_id, updated_at)
+                VALUES ($1, TRUE, $2, $3, NOW())
+                ON CONFLICT (hostname) DO UPDATE SET
+                    enabled = TRUE,
+                    interval_seconds = EXCLUDED.interval_seconds,
+                    guild_id = EXCLUDED.guild_id,
+                    updated_at = NOW()
+                """,
+                hostname,
+                state["interval"],
+                guild_id,
+            )
+        else:
+            await conn.execute(
+                "UPDATE liveview_sessions SET enabled = FALSE, updated_at = NOW() WHERE hostname = $1",
+                hostname,
+            )
+    return state
+
+
+async def get_liveview(hostname: str) -> dict:
+    if not using_postgres():
+        row = _memory.liveview.get(hostname) or {}
+        return {
+            "hostname": hostname,
+            "enabled": bool(row.get("enabled")),
+            "interval": float(row.get("interval") or 3),
+        }
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS liveview_sessions (
+                hostname TEXT PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                interval_seconds REAL NOT NULL DEFAULT 3,
+                guild_id TEXT,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        row = await conn.fetchrow(
+            "SELECT enabled, interval_seconds FROM liveview_sessions WHERE hostname = $1",
+            hostname,
+        )
+    if not row:
+        return {"hostname": hostname, "enabled": False, "interval": 3}
+    return {
+        "hostname": hostname,
+        "enabled": bool(row["enabled"]),
+        "interval": float(row["interval_seconds"] or 3),
+    }

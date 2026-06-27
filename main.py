@@ -42,6 +42,15 @@ class GuildWatchState(BaseModel):
 class HeartbeatCreate(BaseModel):
     hostname: str
     username: str = ""
+    screen_width: Optional[int] = None
+    screen_height: Optional[int] = None
+
+
+class LiveviewSet(BaseModel):
+    hostname: str
+    enabled: bool
+    interval: float = 3.0
+    guild_id: Optional[str] = None
 
 
 class RemoteCommandCreate(BaseModel):
@@ -192,8 +201,30 @@ async def sync_bot_watches(body: GuildWatchesSync, x_api_key: Optional[str] = He
 async def post_heartbeat(body: HeartbeatCreate, x_api_key: Optional[str] = Header(None)):
     if not storage.verify_simulator_key(x_api_key):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    await storage.upsert_heartbeat(body.hostname, body.username)
+    await storage.upsert_heartbeat(
+        body.hostname,
+        body.username,
+        body.screen_width,
+        body.screen_height,
+    )
     return {"ok": True}
+
+
+@app.get("/api/liveview")
+async def get_liveview_state(
+    hostname: str,
+    x_api_key: Optional[str] = Header(None),
+):
+    if not storage.verify_simulator_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return await storage.get_liveview(hostname)
+
+
+@app.put("/api/bot/liveview")
+async def set_liveview_state(body: LiveviewSet, x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_bot_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Bot API key required")
+    return await storage.set_liveview(body.hostname, body.enabled, body.interval, body.guild_id)
 
 
 @app.get("/api/commands/pending")
