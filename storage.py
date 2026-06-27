@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -45,6 +46,7 @@ class MemoryStore:
     commands: list[dict] = field(default_factory=list)
     liveview: dict[str, dict] = field(default_factory=dict)
     liveview_frames: dict[str, dict] = field(default_factory=dict)
+    simulator_release: dict = field(default_factory=dict)
 
     def create_session(self, sid: str, label: Optional[str]) -> dict:
         self.sessions = [s for s in self.sessions if s["id"] != sid]
@@ -980,3 +982,82 @@ async def get_liveview(hostname: str) -> dict:
         "interval": float(row["interval_seconds"] or 3),
         "quality": str(row["quality_preset"] or "balanced"),
     }
+
+
+async def upsert_simulator_release(data: bytes) -> dict:
+    if len(data) < 1024 * 1024:
+        raise ValueError("Release file too small")
+    digest = hashlib.sha256(data).hexdigest()
+    meta = {"sha256": digest, "size": len(data)}
+    if not using_postgres():
+        _memory.simulator_release = {"data": data, **meta}
+        return meta
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS simulator_release (
+                id INT PRIMARY KEY DEFAULT 1,
+                data BYTEA NOT NULL,
+                sha256 TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT single_release CHECK (id = 1)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO simulator_release (id, data, sha256, updated_at)
+            VALUES (1, $1, $2, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                data = EXCLUDED.data,
+                sha256 = EXCLUDED.sha256,
+                updated_at = NOW()
+            """,
+            data,
+            digest,
+        )
+    return meta
+
+
+async def get_simulator_release_meta() -> dict | None:
+    if not using_postgres():
+        row = _memory.simulator_release
+        if not row or not row.get("data"):
+            return None
+        return {"sha256": row["sha256"], "size": row["size"]}
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS simulator_release (
+                id INT PRIMARY KEY DEFAULT 1,
+                data BYTEA NOT NULL,
+                sha256 TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT single_release CHECK (id = 1)
+            )
+            """
+        )
+        row = await conn.fetchrow(
+            "SELECT sha256, octet_length(data) AS size FROM simulator_release WHERE id = 1"
+        )
+    if not row:
+        return None
+    return {"sha256": row["sha256"], "size": int(row["size"])}
+
+
+async def get_simulator_release_bytes() -> bytes | None:
+    if not using_postgres():
+        row = _memory.simulator_release
+        if not row:
+            return None
+        data = row.get("data")
+        return data if isinstance(data, bytes) else None
+    pool = await _get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT data FROM simulator_release WHERE id = 1")
+    if not row:
+        return None
+    data = row["data"]
+    return bytes(data) if data else None

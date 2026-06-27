@@ -1,9 +1,11 @@
 import json
+import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 import storage
@@ -214,6 +216,47 @@ async def post_heartbeat(body: HeartbeatCreate, x_api_key: Optional[str] = Heade
         body.screen_height,
     )
     return {"ok": True}
+
+
+@app.put("/api/simulator/release")
+async def upload_simulator_release(
+    request: Request,
+    x_api_key: Optional[str] = Header(None),
+):
+    if not storage.verify_simulator_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    data = await request.body()
+    try:
+        meta = await storage.upsert_simulator_release(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, **meta}
+
+
+@app.get("/api/simulator/release")
+async def simulator_release_info():
+    """Hash + download info — clients compare sha256, no manual version numbers."""
+    meta = await storage.get_simulator_release_meta()
+    if meta:
+        return {"hosted": True, "sha256": meta["sha256"], "size": meta["size"]}
+    url = os.getenv("SIMULATOR_RELEASE_URL", "").strip()
+    if url:
+        return {"hosted": False, "url": url, "sha256": None, "size": None}
+    return {"hosted": False, "sha256": None, "size": None}
+
+
+@app.get("/api/simulator/download")
+async def download_simulator_release(x_api_key: Optional[str] = Header(None)):
+    if not storage.verify_simulator_key(x_api_key):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    data = await storage.get_simulator_release_bytes()
+    if not data:
+        raise HTTPException(status_code=404, detail="No release uploaded yet")
+    return Response(
+        content=data,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": 'attachment; filename="SZCTrap.exe"'},
+    )
 
 
 @app.get("/api/liveview")
