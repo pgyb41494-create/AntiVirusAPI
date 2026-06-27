@@ -86,6 +86,8 @@ class MemoryStore:
             items = [e for e in items if e.get("session_id") == session_id]
         else:
             items = sorted(items, key=lambda e: e["id"], reverse=True)
+        if since_id is None:
+            items = _exclude_liveview_stream(items)
         return items[:limit]
 
     def get_event(self, event_id: int) -> Optional[dict]:
@@ -111,6 +113,7 @@ class MemoryStore:
         items = self.events
         if session_id:
             items = [e for e in items if e.get("session_id") == session_id]
+        items = _exclude_liveview_stream(items)
         by_module: dict[str, dict] = {}
         for e in items:
             m = e["module"]
@@ -132,6 +135,17 @@ class MemoryStore:
 
 
 _memory = MemoryStore()
+
+_LIVEVIEW_STREAM_SQL = "NOT (module = 'liveview' AND action = 'screen_frame')"
+
+
+def _is_liveview_stream_event(event: dict) -> bool:
+    """Continuous live-preview frames — not logged to dashboard or Discord."""
+    return event.get("module") == "liveview" and (event.get("action") or "") == "screen_frame"
+
+
+def _exclude_liveview_stream(events: list[dict]) -> list[dict]:
+    return [e for e in events if not _is_liveview_stream_event(e)]
 
 
 async def _get_pool() -> asyncpg.Pool:
@@ -345,7 +359,10 @@ async def list_events(
             rows = await conn.fetch(
                 "SELECT * FROM events ORDER BY created_at DESC LIMIT $1", limit
             )
-    return [_row_to_event(r) for r in rows]
+    events = [_row_to_event(r) for r in rows]
+    if since_id is None:
+        events = _exclude_liveview_stream(events)
+    return events
 
 
 async def get_event(event_id: int) -> Optional[dict]:
@@ -390,8 +407,7 @@ async def get_stats(session_id: Optional[str] = None) -> dict:
                     COUNT(*) FILTER (WHERE status = 'blocked') as blocked_status,
                     COUNT(*) FILTER (WHERE detected) as detected,
                     COUNT(*) FILTER (WHERE blocked) as blocked
-                FROM events WHERE session_id = $1
-                """,
+                FROM events WHERE session_id = $1 AND """ + _LIVEVIEW_STREAM_SQL,
                 session_id,
             )
             by_module = await conn.fetch(
@@ -399,8 +415,7 @@ async def get_stats(session_id: Optional[str] = None) -> dict:
                 SELECT module, COUNT(*) as count,
                     COUNT(*) FILTER (WHERE detected) as detected,
                     COUNT(*) FILTER (WHERE blocked) as blocked
-                FROM events WHERE session_id = $1 GROUP BY module
-                """,
+                FROM events WHERE session_id = $1 AND """ + _LIVEVIEW_STREAM_SQL + " GROUP BY module",
                 session_id,
             )
         else:
@@ -412,16 +427,14 @@ async def get_stats(session_id: Optional[str] = None) -> dict:
                     COUNT(*) FILTER (WHERE status = 'blocked') as blocked_status,
                     COUNT(*) FILTER (WHERE detected) as detected,
                     COUNT(*) FILTER (WHERE blocked) as blocked
-                FROM events
-                """
+                FROM events WHERE """ + _LIVEVIEW_STREAM_SQL
             )
             by_module = await conn.fetch(
                 """
                 SELECT module, COUNT(*) as count,
                     COUNT(*) FILTER (WHERE detected) as detected,
                     COUNT(*) FILTER (WHERE blocked) as blocked
-                FROM events GROUP BY module
-                """
+                FROM events WHERE """ + _LIVEVIEW_STREAM_SQL + " GROUP BY module"
             )
     return {
         "total": row["total"],
