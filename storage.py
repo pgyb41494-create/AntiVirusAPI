@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if 
 
 _pg_pool: asyncpg.Pool | None = None
 _liveview_cache: dict[str, dict] = {}
+_memory_frame_seq: dict[str, int] = {}
 
 
 def _pg_url(url: str) -> str:
@@ -788,6 +790,37 @@ async def latest_liveview_event(hostname: str, since_id: Optional[int] = None) -
     return event
 
 
+async def _persist_liveview_frame_pg(host: str, merged: dict) -> None:
+    """Background Postgres write — live reads use in-memory cache."""
+    try:
+        pool = await _get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS liveview_frames (
+                    hostname TEXT PRIMARY KEY,
+                    frame_id BIGINT NOT NULL DEFAULT 0,
+                    payload JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            await conn.execute(
+                """
+                INSERT INTO liveview_frames (hostname, frame_id, payload, updated_at)
+                VALUES ($1, 1, $2::jsonb, NOW())
+                ON CONFLICT (hostname) DO UPDATE SET
+                    frame_id = liveview_frames.frame_id + 1,
+                    payload = EXCLUDED.payload,
+                    updated_at = NOW()
+                """,
+                host,
+                json.dumps(merged),
+            )
+    except Exception:
+        pass
+
+
 async def upsert_liveview_frame(hostname: str, payload: dict) -> dict:
     """Fast single-row frame store for high-FPS streaming (not the events table)."""
     host = hostname.strip()
@@ -810,32 +843,8 @@ async def upsert_liveview_frame(hostname: str, payload: dict) -> dict:
         _liveview_cache[host] = event
         return event
 
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS liveview_frames (
-                hostname TEXT PRIMARY KEY,
-                frame_id BIGINT NOT NULL DEFAULT 0,
-                payload JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-            """
-        )
-        row = await conn.fetchrow(
-            """
-            INSERT INTO liveview_frames (hostname, frame_id, payload, updated_at)
-            VALUES ($1, 1, $2::jsonb, NOW())
-            ON CONFLICT (hostname) DO UPDATE SET
-                frame_id = liveview_frames.frame_id + 1,
-                payload = EXCLUDED.payload,
-                updated_at = NOW()
-            RETURNING frame_id, updated_at
-            """,
-            host,
-            json.dumps(merged),
-        )
-    fid = int(row["frame_id"])
+    fid = _memory_frame_seq.get(host, 0) + 1
+    _memory_frame_seq[host] = fid
     event = {
         "id": fid,
         "module": "liveview",
@@ -843,9 +852,10 @@ async def upsert_liveview_frame(hostname: str, payload: dict) -> dict:
         "status": "success",
         "payload": merged,
         "session_id": None,
-        "created_at": row["updated_at"].isoformat(),
+        "created_at": now,
     }
     _liveview_cache[host] = event
+    asyncio.create_task(_persist_liveview_frame_pg(host, merged))
     return event
 
 
